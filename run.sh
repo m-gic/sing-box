@@ -1,28 +1,22 @@
 #!/bin/bash
 
-export CLOUDFLARE_TUNNEL_TOKEN="${1:-your cloudflare tunnel token}"
-export CLOUDFLARE_TUNNEL_HOSTNAME="${2:-your cloudflare tunnel hostname}"
-export UUID="${3:-your uuid}"
-export FILE_PATH="${4:-.}"
-export CLOUDFLARE_IP="${5:-chinese.com}"
-
-# Auto-detect architecture: one-liner
 export ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
-
-# Create working directory
-mkdir -p "$FILE_PATH"
-cd "$FILE_PATH"
-
-# Port config (override via env, unset to skip protocol)
+export UUID="${UUID:-your uuid}"
+export CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-your cloudflare tunnel token}"
+export CLOUDFLARE_TUNNEL_HOSTNAME="${CLOUDFLARE_TUNNEL_HOSTNAME:-your cloudflare tunnel hostname}"
+export CLOUDFLARE_IP="${CLOUDFLARE_IP:-chinese.com}"
+export FILE_PATH="${FILE_PATH:-.}"
 export VLESS_PORT="${VLESS_PORT:-}"
 export VMESS_PORT="${VMESS_PORT:-}"
-export SS_PORT="${SS_PORT:-}"
+export SOCKS_PORT="${SOCKS_PORT:-}"
 export TROJAN_PORT="${TROJAN_PORT:-}"
 export HYSTERIA2_PORT="${HYSTERIA2_PORT:-}"
 export WG_PORT="${WG_PORT:-}"
-export S5_PORT="${S5_PORT:-}"
 export HTTP_PORT="${HTTP_PORT:-}"
 export TUIC_PORT="${TUIC_PORT:-}"
+
+mkdir -p "$FILE_PATH"
+cd "$FILE_PATH"
 
 curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" -o ./cloudflared
 chmod +x cloudflared
