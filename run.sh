@@ -1,15 +1,21 @@
 #!/bin/bash
 
 export NAME=''
-export UUID='' # your uuid
+export UUID=''
 export CLOUDFLARE_TUNNEL_TOKEN=''
 export CLOUDFLARE_TUNNEL_HOSTNAME=''
-export CLOUDFLARE_IP='saas.sin.fan'# your cf ip
+export CLOUDFLARE_IP='saas.sin.fan'
+export CLOUDFLARE_PORT=8000
+export VLESS_PORT=''
 
-curl -L 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64' -o ./cloudflared
-chmod +x cloudflared
-./cloudflared --version
-nohup ./cloudflared --no-autoupdate tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > cloudflared.log 2>&1 &
+PUBLIC_IP=$(curl -s 'https://one.one.one.one/cdn-cgi/trace' | grep -oP '^ip=\K[^$]+' || echo "$CLOUDFLARE_IP")
+# 下载并运行cloudflared
+if [[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]] && [[ -n "$CLOUDFLARE_TUNNEL_HOSTNAME" ]]; then
+  curl -L 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64' -o ./cloudflared
+  chmod +x cloudflared
+  ./cloudflared --version
+  nohup ./cloudflared --no-autoupdate tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > cloudflared.log 2>&1 &
+fi
 
 curl -O -L https://github.com/SagerNet/sing-box/releases/download/v1.8.0/sing-box-1.8.0-linux-amd64.tar.gz
 tar -zxf sing-box-1.8.0-linux-amd64.tar.gz
@@ -51,11 +57,23 @@ cat <<EOF > sing-box-1.8.0-linux-amd64/config.json
     "disable_expire": false
   },
   "inbounds": [
+EOF
+
+# 配置vless inbound
+if [[ -n "$VLESS_PORT" ]]; then
+  # 确定监听端口
+  if [[ "$VLESS_PORT" == "cloudflare" ]]; then
+    LISTEN_PORT=$CLOUDFLARE_PORT
+  else
+    LISTEN_PORT=$VLESS_PORT
+  fi
+  
+  cat <<EOF >> sing-box-1.8.0-linux-amd64/config.json
     {
       "type": "vless",
       "tag": "vless-in",
       "listen": "::",
-      "listen_port": 8000,
+      "listen_port": $LISTEN_PORT,
       "users": [
         {
           "name": "misaka",
@@ -77,6 +95,10 @@ cat <<EOF > sing-box-1.8.0-linux-amd64/config.json
         "padding": false
       }
     }
+EOF
+fi
+
+cat <<EOF >> sing-box-1.8.0-linux-amd64/config.json
   ],
   "outbounds": [
     {
@@ -148,5 +170,16 @@ cat <<EOF > sing-box-1.8.0-linux-amd64/config.json
 }
 EOF
 
-echo "vless://$UUID@$CLOUDFLARE_IP:443?encryption=none&security=tls&sni=$CLOUDFLARE_TUNNEL_HOSTNAME&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=$CLOUDFLARE_TUNNEL_HOSTNAME&path=%2Fmisaka#$NAME"
+if [[ -n "$VLESS_PORT" ]]; then
+  if [[ "$VLESS_PORT" == "cloudflare" ]]; then
+    # 走cloudflare隧道
+    if [[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]] && [[ -n "$CLOUDFLARE_TUNNEL_HOSTNAME" ]]; then
+      echo "vless://$UUID@$CLOUDFLARE_IP:443?encryption=none&security=tls&sni=$CLOUDFLARE_TUNNEL_HOSTNAME&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=$CLOUDFLARE_TUNNEL_HOSTNAME&path=%2Fmisaka#$NAME"
+    fi
+  else
+    # 直连
+    echo "vless://$UUID@$PUBLIC_IP:$VLESS_PORT?encryption=none&security=none&type=ws&host=&path=%2Fmisaka#$NAME"
+  fi
+fi
+
 sing-box-1.8.0-linux-amd64/sing-box run -c sing-box-1.8.0-linux-amd64/config.json
