@@ -194,6 +194,11 @@ prepare_protocols() {
 
 prepare_protocols
 
+# 流控 xtls-rprx-vision：仅 VLESS 作为 Reality 链头(tcp + reality)时启用；
+# VLESS 作为被回落的内部入口(明文 tcp)或走 ws 时不支持 Vision
+VLESS_FLOW=''
+in_array vless "${HEADS[@]}" && VLESS_FLOW='xtls-rprx-vision'
+
 # ========== REALITY 密钥 ==========
 # 私钥首次随机生成并落盘复用(不再由 UUID 派生，知道 UUID 的人无法推出私钥)；公钥由私钥推导
 # 结果写入 REALITY_PRIVATE_KEY / REALITY_PUBLIC_KEY
@@ -417,12 +422,13 @@ stream_tls() {
   echo "{\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$TLS_SERVER_NAME\", \"alpn\": [\"http/1.1\"], \"certificates\": [{\"certificateFile\": \"$CERT_FILE\", \"keyFile\": \"$KEY_FILE\"}]}}"
 }
 
-# ---- settings 片段：proto_settings <proto> [fallbacks JSON 数组] ----
+# ---- settings 片段：proto_settings <proto> [fallbacks JSON 数组] [flow] ----
 proto_settings() {
-  local fb=""
+  local fb="" flow=""
   [[ -n "$2" ]] && fb=", \"fallbacks\": $2"
+  [[ -n "$3" ]] && flow=", \"flow\": \"$3\""
   case "$1" in
-    vless)  echo "{\"clients\": [{\"id\": \"$UUID\", \"email\": \"misaka\"}], \"decryption\": \"none\"$fb}" ;;
+    vless)  echo "{\"clients\": [{\"id\": \"$UUID\", \"email\": \"misaka\"$flow}], \"decryption\": \"none\"$fb}" ;;
     vmess)  echo "{\"clients\": [{\"id\": \"$UUID\", \"email\": \"misaka\"}]}" ;;
     trojan) echo "{\"clients\": [{\"password\": \"$UUID\", \"email\": \"misaka\"}]$fb}" ;;
     shadowsocks) echo "{\"method\": \"aes-256-gcm\", \"password\": \"$UUID\", \"network\": \"tcp\"}" ;;
@@ -460,7 +466,7 @@ inbounds_front() {
 
 # Reality 链：链头监听自己的端口并套 Reality；被回落到的协议依次监听 127.0.0.1 内部端口，由上一级回落过来
 inbounds_chains() {
-  local h p fb listen port stream
+  local h p fb flow listen port stream
   for h in "${HEADS[@]}"; do
     p="$h"
     while [[ -n "$p" ]]; do
@@ -471,7 +477,9 @@ inbounds_chains() {
       else
         listen="127.0.0.1"; port="${IPORT[$p]}"; stream=$(stream_tcp_plain)
       fi
-      INB+=("$(inbound_json "$p-in" "$listen" "$port" "$p" "$(proto_settings "$p" "$fb")" "$stream")")
+      flow=""
+      [[ "$p" == vless && "$p" == "$h" ]] && flow="$VLESS_FLOW"
+      INB+=("$(inbound_json "$p-in" "$listen" "$port" "$p" "$(proto_settings "$p" "$fb" "$flow")" "$stream")")
       p="${FB[$p]}"
     done
   done
@@ -497,7 +505,7 @@ ss_plugin_param() {
 reality_link() {
   local rq="security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=$REALITY_PUBLIC_KEY&type=tcp&sid=cdcf853c"
   case "$1" in
-    vless)  echo "vless://$UUID@$PUBLIC_IP:$2?encryption=none&$rq#$NAME_ENC-VLESS" ;;
+    vless)  echo "vless://$UUID@$PUBLIC_IP:$2?encryption=none${VLESS_FLOW:+&flow=$VLESS_FLOW}&$rq#$NAME_ENC-VLESS" ;;
     vmess)  echo "vmess://$UUID@$PUBLIC_IP:$2?encryption=auto&$rq#$NAME_ENC-VMESS" ;;
     trojan) echo "trojan://$UUID@$PUBLIC_IP:$2?$rq#$NAME_ENC-TROJAN" ;;
     shadowsocks) echo "ss://$SS_USERINFO@$PUBLIC_IP:$2?$rq#$NAME_ENC-SS" ;;
