@@ -4,7 +4,6 @@
 NAME=${NAME:-''}
 UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
 CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-''}
-CLOUDFLARE_TUNNEL_HOSTNAME=${CLOUDFLARE_TUNNEL_HOSTNAME:-''}
 CLOUDFLARE_IP=${CLOUDFLARE_IP:-''}
 PORT=${PORT:-''}
 FALLBACK_SITE=${FALLBACK_SITE:-''}
@@ -98,7 +97,7 @@ HEADS=()           # Reality 链头(独占端口的单个协议也算)
 ACTIVE_MODE=""     # SHARED 统一的模式：ws / cloudflare / 空
 FRONT_ON=""        # 是否需要前置入口(ws / cloudflare，或只回落)
 SHARE_FRONT=""     # 前置入口是否与某条 Reality 链共用端口
-DEFAULT_FRONT_PORT=8000   # cloudflare 模式固定用它；ws 模式 PORT 留空时也用它
+DEFAULT_FRONT_PORT=8000   # ws 模式 PORT 留空时用它；cloudflare 模式先用它，读到隧道日志里的端口后会覆盖
 FRONT_IPORT=40005         # 与 Reality 共用端口时，ws 前置入口改监听 127.0.0.1 的这个端口
 
 # 回落网站：PORT 和 FALLBACK_SITE 都填了才启用；host 或 host:port，不写端口默认 80
@@ -184,7 +183,7 @@ plan_front() {
   local p
   [[ -n "$ACTIVE_MODE$WEB_DEST" ]] || return 0
   FRONT_ON=1
-  # cloudflare 固定 8000；其它(ws / 只回落)用 PORT，留空 8000
+  # cloudflare 先用 8000(之后从 cloudflared 日志读到隧道的回源端口再覆盖)；其它(ws / 只回落)用 PORT，留空 8000
   if [[ "$ACTIVE_MODE" == cloudflare ]]; then FRONT_PORT="$DEFAULT_FRONT_PORT"; else FRONT_PORT="${PORT:-$DEFAULT_FRONT_PORT}"; fi
   valid_port "$FRONT_PORT" || mode_error "PORT='$PORT' is not a valid port"
   FRONT_PORT=$((10#$FRONT_PORT))
@@ -232,17 +231,9 @@ KM_ON=""
 
 if [[ -n "$KM_ON" ]]; then
   KM_BIN="$BASE_DIR/komari-agent"
-  KM_PID_FILE="$BASE_DIR/komari-agent.pid"
 
-  # 脚本被重启时，先停掉上一次留下的 agent，避免出现两个探针进程
-  if [[ -s "$KM_PID_FILE" ]]; then
-    old_pid=$(<"$KM_PID_FILE")
-    if kill -0 "$old_pid" 2>/dev/null && grep -q komari-agent "/proc/$old_pid/cmdline" 2>/dev/null; then
-      echo "[KOMARI] Stopping previous agent (pid $old_pid)"
-      kill "$old_pid"
-      sleep 1
-    fi
-  fi
+  # 脚本被重启时，按进程名先停掉上一次留下的探针，避免出现两个探针进程
+  pkill -x komari-agent && { echo "[KOMARI] Stopped previous agent"; sleep 1; }
 
   dl "$KM_BIN" "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-$ARCH" || exit 1
   chmod +x "$KM_BIN"
@@ -250,11 +241,9 @@ if [[ -n "$KM_ON" ]]; then
   export AGENT_ENDPOINT="$KOMARI_ENDPOINT" AGENT_TOKEN="$KOMARI_TOKEN"
   if [[ -z "$XRAY_ON" ]]; then
     echo "[KOMARI] No proxy protocol enabled, running the agent only, reporting to $KOMARI_ENDPOINT"
-    echo $$ > "$KM_PID_FILE"
     exec "$KM_BIN"
   fi
   nohup "$KM_BIN" > "$BASE_DIR/komari-agent.log" 2>&1 &
-  echo $! > "$KM_PID_FILE"
   unset AGENT_ENDPOINT AGENT_TOKEN
   echo "[KOMARI] Agent started, reporting to $KOMARI_ENDPOINT"
 fi
@@ -395,26 +384,40 @@ setup_tls() {
 [[ "$ACTIVE_MODE" == "ws" || -n "$HY2_PORT" ]] && setup_tls
 
 # ========== cloudflared ==========
-if [[ "$ACTIVE_MODE" == "cloudflare" && -n "$CLOUDFLARE_TUNNEL_TOKEN" && -n "$CLOUDFLARE_TUNNEL_HOSTNAME" ]]; then
+CLOUDFLARE_TUNNEL_HOSTNAME=""   # 隧道域名：不用填，启动 cloudflared 后从它的日志里取
+if [[ "$ACTIVE_MODE" == "cloudflare" && -n "$CLOUDFLARE_TUNNEL_TOKEN" ]]; then
   CF_BIN="$BASE_DIR/cloudflared"
-  CF_PID_FILE="$BASE_DIR/cloudflared.pid"
 
-  # 脚本被重启时，先停掉上一次留下的 cloudflared，避免出现两个隧道进程
-  if [[ -s "$CF_PID_FILE" ]]; then
-    old_pid=$(<"$CF_PID_FILE")
-    if kill -0 "$old_pid" 2>/dev/null && grep -q cloudflared "/proc/$old_pid/cmdline" 2>/dev/null; then
-      echo "[CF] Stopping previous cloudflared (pid $old_pid)"
-      kill "$old_pid"
-      sleep 1
-    fi
-  fi
+  # 脚本被重启时，按进程名先停掉上一次留下的 cloudflared，避免出现两个隧道进程
+  pkill -x cloudflared && { echo "[CF] Stopped previous cloudflared"; sleep 1; }
 
   dl "$CF_BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH" || exit 1
   chmod +x "$CF_BIN"
   "$CF_BIN" --version
   # Token 通过环境变量只传给这一个进程，不出现在命令行(ps 看不到)
   TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" nohup "$CF_BIN" --no-autoupdate tunnel run > "$BASE_DIR/cloudflared.log" 2>&1 &
-  echo $! > "$CF_PID_FILE"
+
+  # 从日志取隧道的域名和回源端口：等隧道连上后，cloudflared 会打印一行后台下发的配置(ingress 规则)，
+  # 取第一条「有具体域名(不含通配符 *)、Service 是 http://localhost:端口 或 http://127.0.0.1:端口」的规则
+  # (日志里的引号带反斜杠，先还原)
+  for _ in {1..30}; do
+    cf_cfg=$(grep -a 'Updated to new configuration' "$BASE_DIR/cloudflared.log" | tail -1)
+    [[ -n "$cf_cfg" ]] && break
+    sleep 1
+  done
+  cf_cfg="${cf_cfg//\\\"/\"}"
+  cf_rule=$(grep -oE '\{[^{}]*\}' <<< "$cf_cfg" | grep -E '"hostname":"[^"*]+"' | grep -E '"service":"http://(localhost|127\.0\.0\.1):[0-9]+"' | head -1)
+  CLOUDFLARE_TUNNEL_HOSTNAME=$(grep -oE '"hostname":"[^"]+"' <<< "$cf_rule" | cut -d'"' -f4)
+  cf_port=$(grep -oE '"service":"http://[^"]+"' <<< "$cf_rule" | grep -oE '[0-9]+"$' | tr -d '"')
+  if [[ -n "$CLOUDFLARE_TUNNEL_HOSTNAME" && -n "$cf_port" ]]; then
+    valid_port "$cf_port" || mode_error "Tunnel service port '$cf_port' read from the cloudflared log is not a valid port"
+    FRONT_PORT=$((10#$cf_port))
+    check_ports   # 端口变了，重新检查是否与 Reality 端口 / 内部保留端口冲突
+    echo "[CF] From cloudflared log: hostname=$CLOUDFLARE_TUNNEL_HOSTNAME, tunnel service port=$FRONT_PORT"
+  else
+    CLOUDFLARE_TUNNEL_HOSTNAME=""
+    echo "[CF] Cannot read hostname / port from $BASE_DIR/cloudflared.log (the tunnel needs a Public hostname without * and a Service like http://localhost:PORT)" >&2
+  fi
 fi
 
 # ========== Xray ==========
@@ -424,7 +427,35 @@ XRAY_CONF="$XRAY_DIR/config.json"
 mkdir -p "$XRAY_DIR"
 
 dl "$BASE_DIR/xray.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$([[ $ARCH == amd64 ]] && echo 64 || echo arm64-v8a).zip" || exit 1
-unzip -oq "$BASE_DIR/xray.zip" -d "$XRAY_DIR"
+# 解压：有 unzip 就用 unzip；没有(如精简容器)就用 node 自带的 zlib 解压，不依赖任何额外软件
+if command -v unzip >/dev/null 2>&1; then
+  unzip -oq "$BASE_DIR/xray.zip" -d "$XRAY_DIR"
+else
+  node - "$BASE_DIR/xray.zip" "$XRAY_DIR" <<'JS'
+const fs = require('fs'), zlib = require('zlib'), path = require('path');
+const [zip, dir] = process.argv.slice(-2);
+const b = fs.readFileSync(zip), root = path.resolve(dir);
+let e = b.length - 22;
+while (e >= 0 && b.readUInt32LE(e) !== 0x06054b50) e--;
+if (e < 0) { console.error('not a zip file'); process.exit(1); }
+const n = b.readUInt16LE(e + 10);
+let p = b.readUInt32LE(e + 16);
+for (let i = 0; i < n; i++) {
+  const method = b.readUInt16LE(p + 10), csize = b.readUInt32LE(p + 20);
+  const nlen = b.readUInt16LE(p + 28), xlen = b.readUInt16LE(p + 30), clen = b.readUInt16LE(p + 32);
+  const off = b.readUInt32LE(p + 42), name = b.toString('utf8', p + 46, p + 46 + nlen);
+  p += 46 + nlen + xlen + clen;
+  if (name.endsWith('/')) continue;
+  const ds = off + 30 + b.readUInt16LE(off + 26) + b.readUInt16LE(off + 28);
+  const data = b.subarray(ds, ds + csize);
+  const out = method === 0 ? data : zlib.inflateRawSync(data);
+  const f = path.resolve(root, name);
+  if (!f.startsWith(root + path.sep)) continue;
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, out);
+}
+JS
+fi
 rm -f "$BASE_DIR/xray.zip"
 chmod +x "$XRAY_BIN" 2>/dev/null
 [[ -x "$XRAY_BIN" ]] || { echo "[XRAY] Binary not found after extraction: $XRAY_BIN" >&2; exit 1; }
@@ -551,7 +582,7 @@ hy2_link() {
 }
 
 # ws / cloudflare 链接的共同参数(连接地址、端口、host、名称后缀、证书校验)，按模式确定一次
-#   cloudflare：连 CLOUDFLARE_IP:443，隧道的 Service 要指向 http://localhost:8000
+#   cloudflare：连 CLOUDFLARE_IP:443，隧道的 Service 指向的本机端口从 cloudflared 日志里读取
 #   ws：连 PUBLIC_IP:FRONT_PORT；自签证书用 pcs(证书哈希)固定，allowInsecure 保留给旧客户端
 init_ws_params() {
   WS_IQ=""; WS_VM_INSECURE=0; WS_VM_EXTRA=""; WS_VM_PCS=""
@@ -578,7 +609,7 @@ generate_node() {
 
   if [[ "$ACTIVE_MODE" == cloudflare ]]; then
     if [[ -z "$CLOUDFLARE_TUNNEL_TOKEN" || -z "$CLOUDFLARE_TUNNEL_HOSTNAME" ]]; then
-      echo "[MODE] cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN and CLOUDFLARE_TUNNEL_HOSTNAME, no $proto link generated" >&2
+      echo "[MODE] cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN and a tunnel hostname found in the cloudflared log, no $proto link generated" >&2
       return
     fi
     # VMess 链接里的 ?ed=2560 为 0-RTT early data，Xray 服务端自动识别
