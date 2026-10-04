@@ -582,12 +582,12 @@ hy2_link() {
 }
 
 # ws / cloudflare 链接的共同参数(连接地址、端口、host、名称后缀、证书校验)，按模式确定一次
-#   cloudflare：连 CLOUDFLARE_IP:443，隧道的 Service 指向的本机端口从 cloudflared 日志里读取
+#   cloudflare：连 CLOUDFLARE_IP:443(没设置 CLOUDFLARE_IP 就连从 cloudflared 日志探测到的隧道域名)，隧道的 Service 指向的本机端口从 cloudflared 日志里读取
 #   ws：连 PUBLIC_IP:FRONT_PORT；自签证书用 pcs(证书哈希)固定，allowInsecure 保留给旧客户端
 init_ws_params() {
   WS_IQ=""; WS_VM_INSECURE=0; WS_VM_EXTRA=""; WS_VM_PCS=""
   if [[ "$ACTIVE_MODE" == cloudflare ]]; then
-    WS_ADDR="$CLOUDFLARE_IP"; WS_PORT=443; WS_HOST="$CLOUDFLARE_TUNNEL_HOSTNAME"; WS_SFX=CF
+    WS_ADDR="${CLOUDFLARE_IP:-$CLOUDFLARE_TUNNEL_HOSTNAME}"; WS_PORT=443; WS_HOST="$CLOUDFLARE_TUNNEL_HOSTNAME"; WS_SFX=CF
   else
     WS_ADDR="$PUBLIC_IP"; WS_PORT="$FRONT_PORT"; WS_HOST="$TLS_SERVER_NAME"; WS_SFX=WS
     WS_VM_INSECURE="$TLS_INSECURE"; WS_VM_PCS="$TLS_PCS"
