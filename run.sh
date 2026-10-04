@@ -3,13 +3,13 @@
 # ========== 用户配置 ==========
 NAME=${NAME:-''}
 UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
-CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-''}
-CLOUDFLARE_IP=${CLOUDFLARE_IP:-''}
-PORT=${PORT:-''}
 FALLBACK_SITE=${FALLBACK_SITE:-''}
-VLESS_MODE=${VLESS_MODE:-''}
+PORT=${PORT:-''}
+CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-''}
+CLOUDFLARE_IP=${CLOUDFLARE_IP:-'visa.cn'}
+VLESS_MODE=${VLESS_MODE:-'trojan'}
+TROJAN_MODE=${TROJAN_MODE:-'vmess'}
 VMESS_MODE=${VMESS_MODE:-''}
-TROJAN_MODE=${TROJAN_MODE:-''}
 SHADOWSOCKS_MODE=${SHADOWSOCKS_MODE:-''}
 HYSTERIA2_MODE=${HYSTERIA2_MODE:-''}
 MIXED_MODE=${MIXED_MODE:-''}
@@ -96,7 +96,8 @@ declare -A RPORT   # Reality 链上的每个协议 -> 对外端口(即链头端�
 ENABLED=()         # 所有启用的协议(含被回落到而自动启用的)，订阅链接按此顺序输出
 SHARED=()          # 采用 ws / cloudflare 的协议
 HEADS=()           # Reality 链头(独占端口的单个协议也算)
-ACTIVE_MODE=""     # SHARED 统一的模式：ws / cloudflare / 空
+ACTIVE_MODE=""     # SHARED 统一的模式：ws / cloudflare / 空(try 模式在解析后归并为 cloudflare)
+TRY_TUNNEL=""      # try 模式：用 Cloudflare 临时隧道(trycloudflare.com)，不需要 Token 和域名
 FRONT_ON=""        # 是否需要前置入口(ws / cloudflare，或只回落)
 SHARE_FRONT=""     # 前置入口是否与某条 Reality 链共用端口
 DEFAULT_FRONT_PORT=8000   # ws 模式 PORT 留空时用它；cloudflare 模式先用它，读到隧道日志里的端口后会覆盖
@@ -149,22 +150,24 @@ parse_modes() {
   for p in "${PROTOS[@]}"; do
     m="$(mode_of "$p")"; v="${p^^}_MODE"
     [[ -n "$m" ]] || continue
-    if [[ "$m" == ws || "$m" == cloudflare ]]; then
-      [[ -z "$ACTIVE_MODE" || "$ACTIVE_MODE" == "$m" ]] || mode_error "Protocols using ws / cloudflare share one port (PORT), so they must use the same mode (got: $ACTIVE_MODE $m)"
+    if [[ "$m" == ws || "$m" == cloudflare || "$m" == try ]]; then
+      [[ -z "$ACTIVE_MODE" || "$ACTIVE_MODE" == "$m" ]] || mode_error "Protocols using ws / cloudflare / try share one port (PORT), so they must use the same mode (got: $ACTIVE_MODE $m)"
       SHARED+=("$p"); ACTIVE_MODE="$m"
     elif [[ "$m" =~ ^[0-9]+$ ]]; then
       valid_port "$m" || mode_error "$v='$m': port must be 1-65535"
       NPORT[$p]=$((10#$m))
     elif [[ "$m" =~ ^[a-z]+$ ]]; then
       t="$m"
-      in_array "$t" "${PROTOS[@]}" || mode_error "$v='$m': '$t' is not valid (expected ws / cloudflare / a port, or a fallback protocol: ${PROTOS[*]})"
+      in_array "$t" "${PROTOS[@]}" || mode_error "$v='$m': '$t' is not valid (expected ws / cloudflare / try / a port, or a fallback protocol: ${PROTOS[*]})"
       [[ "$t" != "$p" ]] || mode_error "$v='$m': a protocol cannot fall back to itself"
       [[ "$p" == vless || "$p" == trojan ]] || mode_error "$v='$m': ${p^^} has no fallback ability, only VLESS and TROJAN can choose a fallback"
       FB[$p]="$t"
     else
-      mode_error "$v='$m' is invalid (expected: ws / cloudflare / a port / a protocol name, or empty to disable)"
+      mode_error "$v='$m' is invalid (expected: ws / cloudflare / try / a port / a protocol name, or empty to disable)"
     fi
   done
+  # try = 不用 Token 的 Cloudflare 临时隧道，其余逻辑和 cloudflare 模式相同(明文 WS，固定监听 8000)
+  if [[ "$ACTIVE_MODE" == try ]]; then ACTIVE_MODE=cloudflare; TRY_TUNNEL=1; fi
 }
 
 # 2. 把回落关系整理成 Reality 链：得到 ENABLED / HEADS / CHAIN / HPORT / RPORT
@@ -423,8 +426,9 @@ setup_tls() {
 [[ "$ACTIVE_MODE" == "ws" || -n "$HY2_PORT" ]] && setup_tls
 
 # ========== cloudflared ==========
+# cloudflare 模式：用 Token 跑固定隧道；try 模式：不需要 Token，用 Cloudflare 临时隧道(每次启动域名都会变)
 CLOUDFLARE_TUNNEL_HOSTNAME=""   # 隧道域名：不用填，启动 cloudflared 后从它的日志里取
-if [[ "$ACTIVE_MODE" == "cloudflare" && -n "$CLOUDFLARE_TUNNEL_TOKEN" ]]; then
+if [[ "$ACTIVE_MODE" == "cloudflare" && ( -n "$CLOUDFLARE_TUNNEL_TOKEN" || -n "$TRY_TUNNEL" ) ]]; then
   CF_BIN="$BASE_DIR/cloudflared"
 
   # 脚本被重启时，按进程名先停掉上一次留下的 cloudflared，避免出现两个隧道进程
@@ -433,29 +437,44 @@ if [[ "$ACTIVE_MODE" == "cloudflare" && -n "$CLOUDFLARE_TUNNEL_TOKEN" ]]; then
   dl "$CF_BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH" || exit 1
   chmod +x "$CF_BIN"
   "$CF_BIN" --version
-  # Token 通过环境变量只传给这一个进程，不出现在命令行(ps 看不到)
-  TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" nohup "$CF_BIN" --no-autoupdate tunnel run > "$BASE_DIR/cloudflared.log" 2>&1 &
-
-  # 从日志取隧道的域名和回源端口：等隧道连上后，cloudflared 会打印一行后台下发的配置(ingress 规则)，
-  # 取第一条「有具体域名(不含通配符 *)、Service 是 http://localhost:端口 或 http://127.0.0.1:端口」的规则
-  # (日志里的引号带反斜杠，先还原)
-  for _ in {1..30}; do
-    cf_cfg=$(grep -a 'Updated to new configuration' "$BASE_DIR/cloudflared.log" | tail -1)
-    [[ -n "$cf_cfg" ]] && break
-    sleep 1
-  done
-  cf_cfg="${cf_cfg//\\\"/\"}"
-  cf_rule=$(grep -oE '\{[^{}]*\}' <<< "$cf_cfg" | grep -E '"hostname":"[^"*]+"' | grep -E '"service":"http://(localhost|127\.0\.0\.1):[0-9]+"' | head -1)
-  CLOUDFLARE_TUNNEL_HOSTNAME=$(grep -oE '"hostname":"[^"]+"' <<< "$cf_rule" | cut -d'"' -f4)
-  cf_port=$(grep -oE '"service":"http://[^"]+"' <<< "$cf_rule" | grep -oE '[0-9]+"$' | tr -d '"')
-  if [[ -n "$CLOUDFLARE_TUNNEL_HOSTNAME" && -n "$cf_port" ]]; then
-    valid_port "$cf_port" || mode_error "Tunnel service port '$cf_port' read from the cloudflared log is not a valid port"
-    FRONT_PORT=$((10#$cf_port))
-    check_ports   # 端口变了，重新检查是否与 Reality 端口 / 内部保留端口冲突
-    echo "[CF] From cloudflared log: hostname=$CLOUDFLARE_TUNNEL_HOSTNAME, tunnel service port=$FRONT_PORT"
+  if [[ -n "$TRY_TUNNEL" ]]; then
+    # 临时隧道：回源到本机 FRONT_PORT(8000)；域名从日志里的 https://xxxx.trycloudflare.com 取
+    nohup "$CF_BIN" --no-autoupdate tunnel --url "http://localhost:$FRONT_PORT" > "$BASE_DIR/cloudflared.log" 2>&1 &
+    for _ in {1..30}; do
+      CLOUDFLARE_TUNNEL_HOSTNAME=$(grep -aoE 'https://[a-z0-9-]+\.trycloudflare\.com' "$BASE_DIR/cloudflared.log" | grep -v '^https://api\.' | head -1 | sed 's|https://||')
+      [[ -n "$CLOUDFLARE_TUNNEL_HOSTNAME" ]] && break
+      sleep 1
+    done
+    if [[ -n "$CLOUDFLARE_TUNNEL_HOSTNAME" ]]; then
+      echo "[CF] Quick tunnel hostname from log: $CLOUDFLARE_TUNNEL_HOSTNAME (service port=$FRONT_PORT)"
+    else
+      echo "[CF] Cannot find the trycloudflare.com hostname in $BASE_DIR/cloudflared.log" >&2
+    fi
   else
-    CLOUDFLARE_TUNNEL_HOSTNAME=""
-    echo "[CF] Cannot read hostname / port from $BASE_DIR/cloudflared.log (the tunnel needs a Public hostname without * and a Service like http://localhost:PORT)" >&2
+    # Token 通过环境变量只传给这一个进程，不出现在命令行(ps 看不到)
+    TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" nohup "$CF_BIN" --no-autoupdate tunnel run > "$BASE_DIR/cloudflared.log" 2>&1 &
+
+    # 从日志取隧道的域名和回源端口：等隧道连上后，cloudflared 会打印一行后台下发的配置(ingress 规则)，
+    # 取第一条「有具体域名(不含通配符 *)、Service 是 http://localhost:端口 或 http://127.0.0.1:端口」的规则
+    # (日志里的引号带反斜杠，先还原)
+    for _ in {1..30}; do
+      cf_cfg=$(grep -a 'Updated to new configuration' "$BASE_DIR/cloudflared.log" | tail -1)
+      [[ -n "$cf_cfg" ]] && break
+      sleep 1
+    done
+    cf_cfg="${cf_cfg//\\\"/\"}"
+    cf_rule=$(grep -oE '\{[^{}]*\}' <<< "$cf_cfg" | grep -E '"hostname":"[^"*]+"' | grep -E '"service":"http://(localhost|127\.0\.0\.1):[0-9]+"' | head -1)
+    CLOUDFLARE_TUNNEL_HOSTNAME=$(grep -oE '"hostname":"[^"]+"' <<< "$cf_rule" | cut -d'"' -f4)
+    cf_port=$(grep -oE '"service":"http://[^"]+"' <<< "$cf_rule" | grep -oE '[0-9]+"$' | tr -d '"')
+    if [[ -n "$CLOUDFLARE_TUNNEL_HOSTNAME" && -n "$cf_port" ]]; then
+      valid_port "$cf_port" || mode_error "Tunnel service port '$cf_port' read from the cloudflared log is not a valid port"
+      FRONT_PORT=$((10#$cf_port))
+      check_ports   # 端口变了，重新检查是否与 Reality 端口 / 内部保留端口冲突
+      echo "[CF] From cloudflared log: hostname=$CLOUDFLARE_TUNNEL_HOSTNAME, tunnel service port=$FRONT_PORT"
+    else
+      CLOUDFLARE_TUNNEL_HOSTNAME=""
+      echo "[CF] Cannot read hostname / port from $BASE_DIR/cloudflared.log (the tunnel needs a Public hostname without * and a Service like http://localhost:PORT)" >&2
+    fi
   fi
 fi
 
@@ -608,10 +627,10 @@ reality_link() {
   [[ -n "$SHARE_FRONT" && "$2" == "$FRONT_PORT" ]] && sni="$TLS_SERVER_NAME"
   rq="security=reality&sni=$sni&fp=chrome&pbk=$REALITY_PUBLIC_KEY&type=tcp&sid=cdcf853c"
   case "$1" in
-    vless)  echo "vless://$UUID@$PUBLIC_IP:$2?encryption=none${VLESS_FLOW:+&flow=$VLESS_FLOW}&$rq#$NAME_ENC-VLESS" ;;
-    vmess)  echo "vmess://$UUID@$PUBLIC_IP:$2?encryption=auto&$rq#$NAME_ENC-VMESS" ;;
-    trojan) echo "trojan://$UUID@$PUBLIC_IP:$2?$rq#$NAME_ENC-TROJAN" ;;
-    shadowsocks) echo "ss://$SS_USERINFO@$PUBLIC_IP:$2?$rq#$NAME_ENC-SS" ;;
+    vless)  echo "vless://$UUID@$PUBLIC_IP:$2?encryption=none${VLESS_FLOW:+&flow=$VLESS_FLOW}&$rq#$NAME_ENC" ;;
+    vmess)  echo "vmess://$UUID@$PUBLIC_IP:$2?encryption=auto&$rq#$NAME_ENC" ;;
+    trojan) echo "trojan://$UUID@$PUBLIC_IP:$2?$rq#$NAME_ENC" ;;
+    shadowsocks) echo "ss://$SS_USERINFO@$PUBLIC_IP:$2?$rq#$NAME_ENC" ;;
   esac
 }
 
@@ -619,18 +638,18 @@ reality_link() {
 hy2_link() {
   local q="sni=$TLS_SERVER_NAME"
   [[ "$TLS_INSECURE" == 1 ]] && q+="&insecure=1"
-  echo "hysteria2://$UUID@$PUBLIC_IP:$HY2_PORT/?$q#$NAME_ENC-HY2"
+  echo "hysteria2://$UUID@$PUBLIC_IP:$HY2_PORT/?$q#$NAME_ENC"
 }
 
 # Mixed 链接：SOCKS5 和 HTTP 各一条(同一个端口、同一组账号密码)；明文传输，不加密
 mixed_links() {
-  echo "socks5://misaka:$UUID@$PUBLIC_IP:$MIXED_PORT#$NAME_ENC-SOCKS5"
-  echo "http://misaka:$UUID@$PUBLIC_IP:$MIXED_PORT#$NAME_ENC-HTTP"
+  echo "socks5://misaka:$UUID@$PUBLIC_IP:$MIXED_PORT#$NAME_ENC"
+  echo "http://misaka:$UUID@$PUBLIC_IP:$MIXED_PORT#$NAME_ENC"
 }
 
 # WireGuard 链接(v2rayN / NekoBox / sing-box 等客户端可导入)
 wg_link() {
-  echo "wireguard://$(urlencode "$WG_CLIENT_PRIVATE")@$PUBLIC_IP:$WG_PORT?publickey=$(urlencode "$WG_SERVER_PUBLIC")&address=$(urlencode "$WG_CLIENT_ADDR")&mtu=1420#$NAME_ENC-WG"
+  echo "wireguard://$(urlencode "$WG_CLIENT_PRIVATE")@$PUBLIC_IP:$WG_PORT?publickey=$(urlencode "$WG_SERVER_PUBLIC")&address=$(urlencode "$WG_CLIENT_ADDR")&mtu=1420#$NAME_ENC"
 }
 
 # 标准 WireGuard 配置文件(wg-quick / WireGuard 官方客户端用)
@@ -645,9 +664,9 @@ wg_conf() {
 init_ws_params() {
   WS_IQ=""; WS_VM_INSECURE=0; WS_VM_EXTRA=""; WS_VM_PCS=""
   if [[ "$ACTIVE_MODE" == cloudflare ]]; then
-    WS_ADDR="${CLOUDFLARE_IP:-$CLOUDFLARE_TUNNEL_HOSTNAME}"; WS_PORT=443; WS_HOST="$CLOUDFLARE_TUNNEL_HOSTNAME"; WS_SFX=CF
+    WS_ADDR="${CLOUDFLARE_IP:-$CLOUDFLARE_TUNNEL_HOSTNAME}"; WS_PORT=443; WS_HOST="$CLOUDFLARE_TUNNEL_HOSTNAME"
   else
-    WS_ADDR="$PUBLIC_IP"; WS_PORT="$FRONT_PORT"; WS_HOST="$TLS_SERVER_NAME"; WS_SFX=WS
+    WS_ADDR="$PUBLIC_IP"; WS_PORT="$FRONT_PORT"; WS_HOST="$TLS_SERVER_NAME"
     WS_VM_INSECURE="$TLS_INSECURE"; WS_VM_PCS="$TLS_PCS"
     WS_VM_EXTRA=",\"allowInsecure\":$TLS_INSECURE,\"verify_cert\":$([[ "$TLS_INSECURE" == 1 ]] && echo false || echo true)"
     [[ "$TLS_INSECURE" == 1 ]] && WS_IQ="&allowInsecure=1&pcs=$TLS_PCS"
@@ -666,8 +685,8 @@ generate_node() {
   fi
 
   if [[ "$ACTIVE_MODE" == cloudflare ]]; then
-    if [[ -z "$CLOUDFLARE_TUNNEL_TOKEN" || -z "$CLOUDFLARE_TUNNEL_HOSTNAME" ]]; then
-      echo "[MODE] cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN and a tunnel hostname found in the cloudflared log, no $proto link generated" >&2
+    if [[ -z "$CLOUDFLARE_TUNNEL_HOSTNAME" || ( -z "$TRY_TUNNEL" && -z "$CLOUDFLARE_TUNNEL_TOKEN" ) ]]; then
+      echo "[MODE] cloudflare mode needs CLOUDFLARE_TUNNEL_TOKEN (not needed in try mode) and a tunnel hostname found in the cloudflared log, no $proto link generated" >&2
       return
     fi
     # VMess 链接里的 ?ed=2560 为 0-RTT early data，Xray 服务端自动识别
@@ -676,19 +695,19 @@ generate_node() {
 
   case "$proto" in
     vless)
-      echo "vless://$UUID@$WS_ADDR:$WS_PORT?encryption=none&security=tls&sni=$WS_HOST&fp=chrome&type=ws&host=$WS_HOST&path=$enc$WS_IQ#$NAME_ENC-VLESS-$WS_SFX" ;;
+      echo "vless://$UUID@$WS_ADDR:$WS_PORT?encryption=none&security=tls&sni=$WS_HOST&fp=chrome&type=ws&host=$WS_HOST&path=$enc$WS_IQ#$NAME_ENC" ;;
     vmess)
       printf 'vmess://%s\n' "$(printf '{"v":"2","ps":"%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"none","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","alpn":"","fp":"","insecure":"%s"%s,"vcn":"","pcs":"%s"}' \
-        "$(json_escape "$NAME-VMESS-$WS_SFX")" "$WS_ADDR" "$WS_PORT" "$UUID" "$WS_HOST" "$path$ed" "$WS_HOST" "$WS_VM_INSECURE" "$WS_VM_EXTRA" "$WS_VM_PCS" | b64)" ;;
+        "$(json_escape "$NAME")" "$WS_ADDR" "$WS_PORT" "$UUID" "$WS_HOST" "$path$ed" "$WS_HOST" "$WS_VM_INSECURE" "$WS_VM_EXTRA" "$WS_VM_PCS" | b64)" ;;
     trojan)
-      echo "trojan://$UUID@$WS_ADDR:$WS_PORT?security=tls&sni=$WS_HOST&fp=chrome&type=ws&host=$WS_HOST&path=$enc$WS_IQ#$NAME_ENC-TROJAN-$WS_SFX" ;;
+      echo "trojan://$UUID@$WS_ADDR:$WS_PORT?security=tls&sni=$WS_HOST&fp=chrome&type=ws&host=$WS_HOST&path=$enc$WS_IQ#$NAME_ENC" ;;
     shadowsocks)
       # v2ray-plugin 无法跳过证书校验，自签证书下该节点连不上，不输出
       if [[ "$ACTIVE_MODE" == ws && "$TLS_INSECURE" == 1 ]]; then
         echo "[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, set CERT_HOST + CF_TOKEN. No SS link generated" >&2
         return
       fi
-      echo "ss://$SS_USERINFO@$WS_ADDR:$WS_PORT/?plugin=$(ss_plugin_param "$WS_HOST" "$path")#$NAME_ENC-SS-$WS_SFX" ;;
+      echo "ss://$SS_USERINFO@$WS_ADDR:$WS_PORT/?plugin=$(ss_plugin_param "$WS_HOST" "$path")#$NAME_ENC" ;;
   esac
 }
 
