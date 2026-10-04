@@ -12,6 +12,8 @@ VMESS_MODE=${VMESS_MODE:-''}
 TROJAN_MODE=${TROJAN_MODE:-''}
 SHADOWSOCKS_MODE=${SHADOWSOCKS_MODE:-''}
 HYSTERIA2_MODE=${HYSTERIA2_MODE:-''}
+MIXED_MODE=${MIXED_MODE:-''}
+WIREGUARD_MODE=${WIREGUARD_MODE:-''}
 CERT_HOST=${CERT_HOST:-''}
 KOMARI_ENDPOINT=${KOMARI_ENDPOINT:-''}
 KOMARI_TOKEN=${KOMARI_TOKEN:-''}
@@ -122,6 +124,23 @@ if [[ -n "$HYSTERIA2_MODE" ]]; then
   echo "[MODE] port $HY2_PORT/udp: hysteria2"
 fi
 
+# Mixed(同一个端口同时支持 SOCKS5 和 HTTP 代理，TCP)：数字端口，账号 misaka、密码 UUID，不参与回落链
+MIXED_PORT=""
+if [[ -n "$MIXED_MODE" ]]; then
+  valid_port "$MIXED_MODE" || mode_error "MIXED_MODE='$MIXED_MODE' is invalid (expected a port number 1-65535, or empty to disable)"
+  MIXED_PORT=$((10#$MIXED_MODE))
+  echo "[MODE] port $MIXED_PORT/tcp: mixed (socks5 + http)"
+fi
+
+# WireGuard(Xray 用户态实现，UDP)：数字端口，不参与回落链，也不占用 TCP 端口
+WG_PORT=""
+WG_CLIENT_ADDR="10.0.0.2/32"   # 客户端在隧道里的内网地址
+if [[ -n "$WIREGUARD_MODE" ]]; then
+  valid_port "$WIREGUARD_MODE" || mode_error "WIREGUARD_MODE='$WIREGUARD_MODE' is invalid (expected a port number 1-65535, or empty to disable)"
+  WG_PORT=$((10#$WIREGUARD_MODE))
+  echo "[MODE] port $WG_PORT/udp: wireguard"
+fi
+
 mode_of() { local v="${1^^}_MODE"; printf '%s' "${!v}"; }
 
 # 1. 解析各协议的 *_MODE：ws / cloudflare、数字端口、协议名(回落)
@@ -172,7 +191,7 @@ build_chains() {
   done
   # 没有启用任何协议时不报错：只跑 Komari 探针(见下面的 Komari Agent 段)
   XRAY_ON=""
-  [[ ${#ENABLED[@]} -gt 0 || -n "$HY2_PORT" ]] && XRAY_ON=1
+  [[ ${#ENABLED[@]} -gt 0 || -n "$HY2_PORT" || -n "$MIXED_PORT" || -n "$WG_PORT" ]] && XRAY_ON=1
   for p in "${ENABLED[@]}"; do   # 既不在 ws / cloudflare 组、也没挂到任何 Reality 链上 = 回落成环
     in_array "$p" "${SHARED[@]}" || [[ -n "${RPORT[$p]}" ]] || mode_error "${p^^} is part of a fallback loop: the chain needs a head that no protocol falls back to"
   done
@@ -200,8 +219,9 @@ check_ports() {
   local p q dup ports=()
   for p in "${HEADS[@]}"; do ports+=("${HPORT[$p]}"); done
   [[ -n "$FRONT_ON" && -z "$SHARE_FRONT" ]] && ports+=("$FRONT_PORT")
+  [[ -n "$MIXED_PORT" ]] && ports+=("$MIXED_PORT")
   dup=$(printf '%s\n' "${ports[@]}" | sort | uniq -d | head -1)
-  [[ -z "$dup" ]] || mode_error "Port $dup is used more than once: every Reality chain and the ws / cloudflare group (PORT) need different ports"
+  [[ -z "$dup" ]] || mode_error "Port $dup is used more than once: every Reality chain, the ws / cloudflare group (PORT) and MIXED_MODE need different TCP ports"
   for q in "${ports[@]}"; do
     in_array "$q" "${IPORT[@]}" "$FRONT_IPORT" && mode_error "Port $q conflicts with the internal fallback ports 40001-40005"
   done
@@ -212,7 +232,7 @@ build_chains
 plan_front
 check_ports
 
-[[ -n "$XRAY_ON" ]] && echo "[MODE] enabled=${ENABLED[*]}"
+[[ ${#ENABLED[@]} -gt 0 ]] && echo "[MODE] enabled=${ENABLED[*]}"
 [[ -n "$ACTIVE_MODE" ]] && echo "[MODE] port $FRONT_PORT: $ACTIVE_MODE (${SHARED[*]})${SHARE_FRONT:+ shared with reality}"
 for p in "${HEADS[@]}"; do echo "[MODE] port ${HPORT[$p]}: reality (${CHAIN[$p]// / -> })"; done
 
@@ -227,7 +247,7 @@ in_array vless "${HEADS[@]}" && VLESS_FLOW='xtls-rprx-vision'
 #   没有代理协议：脚本只作为 Komari 启动脚本，agent 前台运行(脚本不退出)
 KM_ON=""
 [[ -n "$KOMARI_ENDPOINT" && -n "$KOMARI_TOKEN" ]] && KM_ON=1
-[[ -n "$XRAY_ON" || -n "$KM_ON" ]] || mode_error "Nothing to run: set a protocol *_MODE / HYSTERIA2_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN"
+[[ -n "$XRAY_ON" || -n "$KM_ON" ]] || mode_error "Nothing to run: set a protocol *_MODE / HYSTERIA2_MODE / MIXED_MODE / WIREGUARD_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN"
 
 if [[ -n "$KM_ON" ]]; then
   KM_BIN="$BASE_DIR/komari-agent"
@@ -267,6 +287,25 @@ if [[ ${#HEADS[@]} -gt 0 ]]; then
   echo "[REALITY] Private key: $REALITY_PRIVATE_KEY"
   echo "[REALITY] Public key: $REALITY_PUBLIC_KEY"
 fi
+
+# ========== WireGuard 密钥 ==========
+# 服务端、客户端各一把私钥，首次随机生成并落盘复用(订阅不会因重启失效)；公钥由私钥推导(标准 base64)
+wg_pub() {
+  { printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'
+    printf '%s' "$1" | base64 -d; } | openssl pkey -inform DER -pubout -outform DER 2>/dev/null | tail -c 32 | b64
+}
+
+load_wg_keys() {
+  local f
+  for f in .wg_server_key .wg_client_key; do
+    [[ -s "$BASE_DIR/$f" ]] || ( umask 077; openssl rand 32 | b64 > "$BASE_DIR/$f" )
+  done
+  WG_SERVER_PRIVATE=$(<"$BASE_DIR/.wg_server_key"); WG_CLIENT_PRIVATE=$(<"$BASE_DIR/.wg_client_key")
+  WG_SERVER_PUBLIC=$(wg_pub "$WG_SERVER_PRIVATE"); WG_CLIENT_PUBLIC=$(wg_pub "$WG_CLIENT_PRIVATE")
+  [[ -n "$WG_SERVER_PUBLIC" && -n "$WG_CLIENT_PUBLIC" ]] || { echo "[WG] Failed to derive public key, check that openssl is installed and $BASE_DIR/.wg_*_key are valid" >&2; exit 1; }
+}
+
+[[ -n "$WG_PORT" ]] && load_wg_keys
 SS_USERINFO=$(printf 'aes-256-gcm:%s' "$UUID" | b64url)
 
 # ========== 链接里的连接地址(PUBLIC_IP) ==========
@@ -295,7 +334,7 @@ resolve_public_addr() {
   echo "[NET] Address in links: $PUBLIC_IP"
 }
 
-if [[ "$ACTIVE_MODE" != "cloudflare" || ${#HEADS[@]} -gt 0 || -n "$HY2_PORT" ]]; then
+if [[ "$ACTIVE_MODE" != "cloudflare" || ${#HEADS[@]} -gt 0 || -n "$HY2_PORT" || -n "$MIXED_PORT" || -n "$WG_PORT" ]]; then
   resolve_public_addr
 fi
 
@@ -551,6 +590,8 @@ collect_inbounds() {
   [[ -n "$FRONT_ON" ]] && inbounds_front
   inbounds_chains
   [[ -n "$HY2_PORT" ]] && INB+=("$(inbound_json hysteria2-in :: "$HY2_PORT" hysteria "{\"version\": 2, \"clients\": [{\"auth\": \"$UUID\", \"email\": \"misaka\"}]}" "$(tls_stream hysteria h3 ', "hysteriaSettings": {"version": 2}')")")
+  [[ -n "$MIXED_PORT" ]] && INB+=("$(inbound_json mixed-in :: "$MIXED_PORT" socks "{\"auth\": \"password\", \"accounts\": [{\"user\": \"misaka\", \"pass\": \"$UUID\"}], \"udp\": false}" "$(stream_tcp_plain)")")
+  [[ -n "$WG_PORT" ]] && INB+=("$(inbound_json wireguard-in :: "$WG_PORT" wireguard "{\"secretKey\": \"$WG_SERVER_PRIVATE\", \"peers\": [{\"publicKey\": \"$WG_CLIENT_PUBLIC\", \"allowedIPs\": [\"$WG_CLIENT_ADDR\"]}], \"mtu\": 1420}" null)")
   ( IFS=,; printf '%s\n' "${INB[*]}" )
 }
 
@@ -579,6 +620,23 @@ hy2_link() {
   local q="sni=$TLS_SERVER_NAME"
   [[ "$TLS_INSECURE" == 1 ]] && q+="&insecure=1"
   echo "hysteria2://$UUID@$PUBLIC_IP:$HY2_PORT/?$q#$NAME_ENC-HY2"
+}
+
+# Mixed 链接：SOCKS5 和 HTTP 各一条(同一个端口、同一组账号密码)；明文传输，不加密
+mixed_links() {
+  echo "socks5://misaka:$UUID@$PUBLIC_IP:$MIXED_PORT#$NAME_ENC-SOCKS5"
+  echo "http://misaka:$UUID@$PUBLIC_IP:$MIXED_PORT#$NAME_ENC-HTTP"
+}
+
+# WireGuard 链接(v2rayN / NekoBox / sing-box 等客户端可导入)
+wg_link() {
+  echo "wireguard://$(urlencode "$WG_CLIENT_PRIVATE")@$PUBLIC_IP:$WG_PORT?publickey=$(urlencode "$WG_SERVER_PUBLIC")&address=$(urlencode "$WG_CLIENT_ADDR")&mtu=1420#$NAME_ENC-WG"
+}
+
+# 标准 WireGuard 配置文件(wg-quick / WireGuard 官方客户端用)
+wg_conf() {
+  printf '[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = %s\nEndpoint = %s:%s\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n' \
+    "$WG_CLIENT_PRIVATE" "$WG_CLIENT_ADDR" "$WG_SERVER_PUBLIC" "$PUBLIC_IP" "$WG_PORT"
 }
 
 # ws / cloudflare 链接的共同参数(连接地址、端口、host、名称后缀、证书校验)，按模式确定一次
@@ -680,6 +738,8 @@ ALL_NODES=""
 emit() { [[ -n "$1" ]] || return 0; echo "$1"; ALL_NODES+="$1"$'\n'; }
 for proto in "${ENABLED[@]}"; do emit "$(generate_node "$proto")"; done
 [[ -n "$HY2_PORT" ]] && emit "$(hy2_link)"
+[[ -n "$MIXED_PORT" ]] && emit "$(mixed_links)"
+[[ -n "$WG_PORT" ]] && emit "$(wg_link)"
 
 echo ""
 echo "=== Nodes ==="
@@ -688,6 +748,11 @@ echo ""
 echo "=== Subscription (base64) ==="
 echo -n "$ALL_NODES" | b64
 echo ""
+if [[ -n "$WG_PORT" ]]; then
+  echo ""
+  echo "=== WireGuard config (wg-quick) ==="
+  wg_conf
+fi
 
 # ========== 运行 ==========
 # 证书在每次启动时 renew(剩余 >30 天会自动跳过)，长期不重启的话请定期重启本脚本
