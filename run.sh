@@ -3,8 +3,8 @@
 # ========== 用户配置 ==========
 NAME=${NAME:-''}
 UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
-FALLBACK_SITE=${FALLBACK_SITE:-''}
 PORT=${PORT:-''}
+CERT_HOST=${CERT_HOST:-''}
 CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-''}
 CLOUDFLARE_IP=${CLOUDFLARE_IP:-'visa.cn'}
 VLESS_MODE=${VLESS_MODE:-'trojan'}
@@ -14,10 +14,8 @@ SHADOWSOCKS_MODE=${SHADOWSOCKS_MODE:-''}
 HYSTERIA2_MODE=${HYSTERIA2_MODE:-''}
 MIXED_MODE=${MIXED_MODE:-''}
 WIREGUARD_MODE=${WIREGUARD_MODE:-''}
-CERT_HOST=${CERT_HOST:-''}
 KOMARI_ENDPOINT=${KOMARI_ENDPOINT:-''}
 KOMARI_TOKEN=${KOMARI_TOKEN:-''}
-CF_TOKEN=${CF_TOKEN:-''}
 
 # 把当前 UUID 写回脚本本身：下次运行直接沿用，不做任何检测
 sed -i "s|^UUID=.*|UUID=\${UUID:-'$UUID'}|" "${BASH_SOURCE[0]}"
@@ -27,7 +25,7 @@ sed -i "s|^UUID=.*|UUID=\${UUID:-'$UUID'}|" "${BASH_SOURCE[0]}"
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR" || exit 1
 
-# ARCH 同时用于 cloudflared / lego 的文件名；Xray 的命名不同(64 / arm64-v8a)，下载处单独换算
+# ARCH 用于 cloudflared / komari-agent 的文件名；Xray 的命名不同(64 / arm64-v8a)，下载处单独换算
 case "$(uname -m)" in
   x86_64|amd64)  ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
@@ -103,18 +101,14 @@ SHARE_FRONT=""     # 前置入口是否与某条 Reality 链共用端口
 DEFAULT_FRONT_PORT=8000   # ws 模式 PORT 留空时用它；cloudflare 模式先用它，读到隧道日志里的端口后会覆盖
 FRONT_IPORT=40005         # 与 Reality 共用端口时，ws 前置入口改监听 127.0.0.1 的这个端口
 
-# 回落网站：PORT 和 FALLBACK_SITE 都填了才启用；host 或 host:port，不写端口默认 80
+# 回落网站：PORT 和 CERT_HOST 都填了才启用，回落到 CERT_HOST 的 80 端口(明文 HTTP)
 WEB_DEST=""
-if [[ -n "$PORT" && -n "$FALLBACK_SITE" ]]; then
-  WEB_DEST="$FALLBACK_SITE"
-  [[ "$WEB_DEST" == *:* ]] || WEB_DEST+=":80"
-  [[ "$WEB_DEST" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || mode_error "FALLBACK_SITE='$FALLBACK_SITE' is invalid (expected host or host:port)"
-  [[ "${WEB_DEST##*:}" != 443 ]] || echo "[WEB] Warning: fallback sends plain HTTP, port 443 will usually reject it; use the site's HTTP port (80)" >&2
+if [[ -n "$PORT" && -n "$CERT_HOST" ]]; then
+  WEB_DEST="$CERT_HOST:80"
+  [[ "$WEB_DEST" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || mode_error "CERT_HOST='$CERT_HOST' is invalid (expected a domain or an IPv4 address)"
   echo "[WEB] Non-ws requests on the front port fall back to $WEB_DEST"
 elif [[ -n "$PORT" ]]; then
-  echo "[WEB] PORT is set but FALLBACK_SITE is empty, fallback disabled (PORT only changes the listening port)" >&2
-elif [[ -n "$FALLBACK_SITE" ]]; then
-  echo "[WEB] FALLBACK_SITE is set but PORT is empty, fallback disabled" >&2
+  echo "[WEB] PORT is set but CERT_HOST is empty, fallback disabled (PORT only changes the listening port)" >&2
 fi
 
 # Hysteria2：只接受数字端口(UDP)，不参与回落链，也不占用 TCP 端口
@@ -352,8 +346,9 @@ else
 fi
 
 # ========== TLS 证书(供 ws / Hysteria2 使用) ==========
-# 证书获取方式(仅 DNS-01，通过 lego + Cloudflare API)：
-#   CERT_HOST 为域名且填了 CF_TOKEN -> 申请可信证书；其余情况(留空 / 填 IP / 无 Token / 申请失败) -> 自签证书兜底
+# 证书来源：脚本不申请证书。CERT_HOST 是域名，且脚本目录下有它的证书 $CERT_HOST.crt 和私钥 $CERT_HOST.key，
+#   并且证书可信(私钥配对、在有效期内、系统信任的 CA 签发、包含 CERT_HOST 这个域名) -> 直接使用，链接不跳过证书校验；
+#   其余情况(留空 / 填 IP / 没有证书文件 / 证书不可信) -> 自签证书
 # 产出：CERT_FILE / KEY_FILE(证书与私钥路径)、TLS_SERVER_NAME(SNI)、
 #   TLS_INSECURE(1=自签，订阅链接需跳过校验；0=可信)、TLS_PCS(自签证书的 SHA256 哈希，hex，链接里的 pcs；可信时为空)
 
@@ -376,46 +371,26 @@ generate_self_signed_cert() {
   chmod 600 "$KEY_FILE"
 }
 
-# 用 lego 通过 DNS-01(Cloudflare)申请证书，成功返回 0 并写入 CERT_FILE / KEY_FILE；不占用任何端口
-# 已有证书走 renew(剩余有效期 >30 天时 lego 自动跳过)，没有则走 run
-issue_cert_for_host() {
-  local host="$1" sub_cmd="run" out email ver
-  local lego="$BASE_DIR/lego" lego_dir="$BASE_DIR/.lego"
-
-  if [[ ! -x "$lego" ]]; then
-    # /releases/latest 会 302 到 /releases/tag/vX.Y.Z，从最终 URL 取版本号(不走 API，无限流)
-    ver=$(curl -fsSL -m 10 -o /dev/null -w '%{url_effective}' 'https://github.com/go-acme/lego/releases/latest' | sed -n 's|.*/tag/v\([0-9.]*\)$|\1|p')
-    [[ -n "$ver" ]] || { echo "[TLS] Cannot detect latest lego version" >&2; return 1; }
-    dl "$BASE_DIR/lego.tar.gz" "https://github.com/go-acme/lego/releases/download/v${ver}/lego_v${ver}_linux_${ARCH}.tar.gz" || return 1
-    tar -zxf "$BASE_DIR/lego.tar.gz" -C "$BASE_DIR" lego
-    rm -f "$BASE_DIR/lego.tar.gz"
-    chmod +x "$lego" 2>/dev/null
-    [[ -x "$lego" ]] || { echo "[TLS] Failed to extract lego" >&2; return 1; }
-  fi
-  mkdir -p "$lego_dir"; chmod 700 "$lego_dir"
-  [[ -s "$lego_dir/certificates/$host.crt" ]] && sub_cmd="renew"
-
-  # ACME 注册邮箱会发给 CA，用 UUID 的哈希片段，不泄露 UUID 本身
-  email="cert-$(printf '%s' "$UUID" | sha256sum | cut -c1-12)@$host"
-  # Token 只传给 lego 这一个进程，不进入脚本环境
-  out=$(CF_DNS_API_TOKEN="$CF_TOKEN" "$lego" --path "$lego_dir" --email "$email" \
-        --dns cloudflare --domains "$host" --accept-tos "$sub_cmd" 2>&1) || {
-    echo "[TLS] DNS-01 (Cloudflare) certificate request failed, lego output:" >&2
-    echo "$out" >&2
-    return 1
-  }
-  CERT_FILE="$lego_dir/certificates/$host.crt"; KEY_FILE="$lego_dir/certificates/$host.key"
-  [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]
+# 检查 CERT_HOST 的证书是否可信：脚本目录下的 $CERT_HOST.crt(可以是带中间证书的完整链) 和 $CERT_HOST.key，
+# 私钥要和证书配对，证书要在有效期内、由系统信任的 CA 签发、且包含 CERT_HOST 这个域名；全部满足才返回 0，并写入 CERT_FILE / KEY_FILE
+trusted_cert_for_host() {
+  local host="$1" crt="$BASE_DIR/$1.crt" key="$BASE_DIR/$1.key" out
+  [[ -s "$crt" && -s "$key" ]] || return 1
+  [[ "$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null)" == "$(openssl pkey -in "$key" -pubout 2>/dev/null)" ]] \
+    || { echo "[TLS] $crt and $key do not match" >&2; return 1; }
+  out=$(openssl verify -verify_hostname "$host" -untrusted "$crt" "$crt" 2>&1)
+  [[ "$out" == *": OK" && "$out" != *error* ]] || { echo "[TLS] $crt is not a trusted certificate for $host:" >&2; echo "$out" >&2; return 1; }
+  CERT_FILE="$crt"; KEY_FILE="$key"
 }
 
 setup_tls() {
   TLS_PCS=""
   TLS_SERVER_NAME="${CERT_HOST:-www.nazhumi.com}"
-  if [[ -n "$CERT_HOST" && ! "$CERT_HOST" =~ $IP_RE && -n "$CF_TOKEN" ]] && issue_cert_for_host "$CERT_HOST"; then
+  if [[ -n "$CERT_HOST" && ! "$CERT_HOST" =~ $IP_RE ]] && trusted_cert_for_host "$CERT_HOST"; then
     TLS_INSECURE=0
   else
     TLS_INSECURE=1
-    echo "[TLS] No trusted certificate available, using self-signed certificate" >&2
+    echo "[TLS] No trusted certificate available (put one at $BASE_DIR/<CERT_HOST>.crt and .key), using self-signed certificate" >&2
     generate_self_signed_cert "$TLS_SERVER_NAME"
     # 新版 Xray 客户端已移除 allowInsecure，自签证书改用证书哈希固定(链接里的 pcs)
     TLS_PCS=$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')
@@ -566,7 +541,7 @@ EOF
 }
 
 # 前置入口(ws / cloudflare / 只回落)：监听 FRONT_PORT，按 HTTP 路径把 ws 流量回落给各内部 ws 入口，
-# 其余请求回落给 FALLBACK_SITE(如果启用)。ws 带 TLS；cloudflare 和只回落是明文(cloudflare 的 TLS 由隧道终结)
+# 其余请求回落给 CERT_HOST 的 80 端口(如果启用)。ws 带 TLS；cloudflare 和只回落是明文(cloudflare 的 TLS 由隧道终结)
 # 与 Reality 共用端口时只听本机，由 Reality 转进来。前置入口本身也是一个 VLESS 入口，直接用 UUID
 inbounds_front() {
   local p fb=() stream flisten="::" fport="$FRONT_PORT"
@@ -704,7 +679,7 @@ generate_node() {
     shadowsocks)
       # v2ray-plugin 无法跳过证书校验，自签证书下该节点连不上，不输出
       if [[ "$ACTIVE_MODE" == ws && "$TLS_INSECURE" == 1 ]]; then
-        echo "[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, set CERT_HOST + CF_TOKEN. No SS link generated" >&2
+        echo "[MODE] ws mode: Shadowsocks (v2ray-plugin) needs a trusted certificate, put one at $BASE_DIR/<CERT_HOST>.crt and .key. No SS link generated" >&2
         return
       fi
       echo "ss://$SS_USERINFO@$WS_ADDR:$WS_PORT/?plugin=$(ss_plugin_param "$WS_HOST" "$path")#$NAME_ENC" ;;
@@ -774,5 +749,5 @@ if [[ -n "$WG_PORT" ]]; then
 fi
 
 # ========== 运行 ==========
-# 证书在每次启动时 renew(剩余 >30 天会自动跳过)，长期不重启的话请定期重启本脚本
+# exec 让 Xray 接管当前进程，脚本到此结束
 exec "$XRAY_BIN" run -c "$XRAY_CONF"
