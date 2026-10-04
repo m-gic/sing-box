@@ -1,49 +1,29 @@
 #!/bin/bash
 
 # ========== 用户配置 ==========
-# *_MODE：留空 = 不启用，可选：
-#   ws          TLS + WebSocket(CERT_HOST + CF_TOKEN 可得到可信证书，否则自签)，共用 PORT(PORT 留空时用默认端口 8000)
-#   cloudflare  Cloudflare 隧道(明文 WS)，固定监听 8000，隧道的 Service 指向 http://localhost:8000，不受 PORT 影响
-#   数字(端口)  Reality，四个协议都支持，端口写在“链尾”协议上：
-#               没有被别的协议回落到 -> 独占该端口(raw reality)
-#               被别的协议回落到(是链尾) -> 整条回落链对外监听这个端口
-#   协议名      仅 VLESS、TROJAN：选择回落到哪个协议(vless / vmess / trojan / shadowsocks)
-#               只写协议名，不写端口；链头、链中都这样写
-#               被回落到的协议自动启用；链尾协议的 *_MODE 必须写端口
-#               例：VLESS_MODE='trojan'  TROJAN_MODE='vmess'  VMESS_MODE='443'
-#                   =>  VLESS -> Trojan -> VMess，对外监听 443
-# ws / cloudflare 这一组必须是同一种模式，共用一个端口，不能与任何 Reality 端口重复
-# 多条 Reality 链各自在链尾写不同端口，互不影响
-# PORT：填了 -> ws 的前置入口改用此端口；留空 -> 用默认端口 8000(cloudflare 模式固定 8000，不看 PORT)
-# FALLBACK_SITE：host 或 host:port，不写端口默认 80；PORT 和 FALLBACK_SITE 都填了就启用回落，与 ws / cloudflare 无关：
-#       前置入口上不匹配 ws 路径的请求，原样转给该站点；没启用 ws / cloudflare 时，PORT 上只做回落(明文入口)
-#       cloudflare 模式下 PORT 只是开关，回落挂在固定的 8000 上
-#       转发的是解密后的明文 HTTP，所以要填对方的 HTTP 端口(通常是 80)，不能填 443
-#       只填其中一个、或两个都留空 -> 不回落
-# PORT 与某条 Reality 链的端口相同(需 ws 模式)：该端口上 Reality 和 ws 共用，也共用回落
-#       Reality 认不出的流量转给本机 ws 入口，Reality 的 dest / serverNames 改用 CERT_HOST(留空为 www.nazhumi.com)
-#       证书是自签时，探测者能看到证书和域名不符
-# HYSTERIA2_MODE：数字(端口) = 启用 Hysteria2(UDP / QUIC)，留空 = 不启用
-#       证书同 ws(可信或自签；自签时链接里带 insecure=1 和 pinSHA256)
-#       走 UDP，和上面所有 TCP 端口互不冲突，可以和 Reality / ws 用同一个端口号
-NAME=''
-UUID=''
-CLOUDFLARE_TUNNEL_TOKEN=''
-CLOUDFLARE_TUNNEL_HOSTNAME=''
-CLOUDFLARE_IP=''
-PORT=''
-FALLBACK_SITE=''
-VLESS_MODE='trojan'
-VMESS_MODE=''
-TROJAN_MODE='vmess'
-SHADOWSOCKS_MODE=''
-HYSTERIA2_MODE=''
-CERT_HOST=''   # 链接里的连接地址(填 IP 或域名)，同时是 ws / Hysteria2 证书的域名(SNI)；留空自动探测公网 IP
-CF_TOKEN=''    # Cloudflare API Token(Zone:Read + DNS:Edit)：CERT_HOST 是域名且填了它，就用 DNS-01 申请可信证书(域名无需指向本机)；否则用自签证书
+NAME=${NAME:-''}
+UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
+CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-''}
+CLOUDFLARE_TUNNEL_HOSTNAME=${CLOUDFLARE_TUNNEL_HOSTNAME:-''}
+CLOUDFLARE_IP=${CLOUDFLARE_IP:-''}
+PORT=${PORT:-''}
+FALLBACK_SITE=${FALLBACK_SITE:-''}
+VLESS_MODE=${VLESS_MODE:-''}
+VMESS_MODE=${VMESS_MODE:-''}
+TROJAN_MODE=${TROJAN_MODE:-''}
+SHADOWSOCKS_MODE=${SHADOWSOCKS_MODE:-''}
+HYSTERIA2_MODE=${HYSTERIA2_MODE:-''}
+CERT_HOST=${CERT_HOST:-''}
+KOMARI_ENDPOINT=${KOMARI_ENDPOINT:-''}
+KOMARI_TOKEN=${KOMARI_TOKEN:-''}
+CF_TOKEN=${CF_TOKEN:-''}
+
+# 把当前 UUID 写回脚本本身：下次运行直接沿用，不做任何检测
+sed -i "s|^UUID=.*|UUID=\${UUID:-'$UUID'}|" "${BASH_SOURCE[0]}"
 
 # ========== 基础环境 ==========
-# 所有下载物和数据目录都放在脚本所在目录；通过管道 / 进程替换运行时退回当前目录
-if [[ -f "${BASH_SOURCE[0]}" ]]; then BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; else BASE_DIR="$(pwd)"; fi
+# 所有下载物和数据目录都放在脚本所在目录
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR" || exit 1
 
 # ARCH 同时用于 cloudflared / lego 的文件名；Xray 的命名不同(64 / arm64-v8a)，下载处单独换算
@@ -191,7 +171,9 @@ build_chains() {
     HPORT[$h]="${NPORT[$q]}"
     for p in ${CHAIN[$h]}; do RPORT[$p]="${HPORT[$h]}"; done
   done
-  [[ ${#ENABLED[@]} -gt 0 || -n "$HY2_PORT" ]] || mode_error "No protocol enabled: set at least one of VLESS_MODE / VMESS_MODE / TROJAN_MODE / SHADOWSOCKS_MODE / HYSTERIA2_MODE"
+  # 没有启用任何协议时不报错：只跑 Komari 探针(见下面的 Komari Agent 段)
+  XRAY_ON=""
+  [[ ${#ENABLED[@]} -gt 0 || -n "$HY2_PORT" ]] && XRAY_ON=1
   for p in "${ENABLED[@]}"; do   # 既不在 ws / cloudflare 组、也没挂到任何 Reality 链上 = 回落成环
     in_array "$p" "${SHARED[@]}" || [[ -n "${RPORT[$p]}" ]] || mode_error "${p^^} is part of a fallback loop: the chain needs a head that no protocol falls back to"
   done
@@ -231,7 +213,7 @@ build_chains
 plan_front
 check_ports
 
-echo "[MODE] enabled=${ENABLED[*]}"
+[[ -n "$XRAY_ON" ]] && echo "[MODE] enabled=${ENABLED[*]}"
 [[ -n "$ACTIVE_MODE" ]] && echo "[MODE] port $FRONT_PORT: $ACTIVE_MODE (${SHARED[*]})${SHARE_FRONT:+ shared with reality}"
 for p in "${HEADS[@]}"; do echo "[MODE] port ${HPORT[$p]}: reality (${CHAIN[$p]// / -> })"; done
 
@@ -239,6 +221,43 @@ for p in "${HEADS[@]}"; do echo "[MODE] port ${HPORT[$p]}: reality (${CHAIN[$p]/
 # VLESS 作为被回落的内部入口(明文 tcp)或走 ws 时不支持 Vision
 VLESS_FLOW=''
 in_array vless "${HEADS[@]}" && VLESS_FLOW='xtls-rprx-vision'
+
+# ========== Komari Agent ==========
+# 探针：KOMARI_ENDPOINT 和 KOMARI_TOKEN 都填了才启用，向 Komari 面板上报本机状态
+#   有代理协议：agent 后台运行，脚本继续启动 Xray
+#   没有代理协议：脚本只作为 Komari 启动脚本，agent 前台运行(脚本不退出)
+KM_ON=""
+[[ -n "$KOMARI_ENDPOINT" && -n "$KOMARI_TOKEN" ]] && KM_ON=1
+[[ -n "$XRAY_ON" || -n "$KM_ON" ]] || mode_error "Nothing to run: set a protocol *_MODE / HYSTERIA2_MODE, or KOMARI_ENDPOINT + KOMARI_TOKEN"
+
+if [[ -n "$KM_ON" ]]; then
+  KM_BIN="$BASE_DIR/komari-agent"
+  KM_PID_FILE="$BASE_DIR/komari-agent.pid"
+
+  # 脚本被重启时，先停掉上一次留下的 agent，避免出现两个探针进程
+  if [[ -s "$KM_PID_FILE" ]]; then
+    old_pid=$(<"$KM_PID_FILE")
+    if kill -0 "$old_pid" 2>/dev/null && grep -q komari-agent "/proc/$old_pid/cmdline" 2>/dev/null; then
+      echo "[KOMARI] Stopping previous agent (pid $old_pid)"
+      kill "$old_pid"
+      sleep 1
+    fi
+  fi
+
+  dl "$KM_BIN" "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-$ARCH" || exit 1
+  chmod +x "$KM_BIN"
+  # Endpoint / Token 通过环境变量只传给这一个进程，不出现在命令行(ps 看不到)
+  export AGENT_ENDPOINT="$KOMARI_ENDPOINT" AGENT_TOKEN="$KOMARI_TOKEN"
+  if [[ -z "$XRAY_ON" ]]; then
+    echo "[KOMARI] No proxy protocol enabled, running the agent only, reporting to $KOMARI_ENDPOINT"
+    echo $$ > "$KM_PID_FILE"
+    exec "$KM_BIN"
+  fi
+  nohup "$KM_BIN" > "$BASE_DIR/komari-agent.log" 2>&1 &
+  echo $! > "$KM_PID_FILE"
+  unset AGENT_ENDPOINT AGENT_TOKEN
+  echo "[KOMARI] Agent started, reporting to $KOMARI_ENDPOINT"
+fi
 
 # ========== REALITY 密钥 ==========
 # 私钥首次随机生成并落盘复用(不由 UUID 派生)；公钥由私钥推导，结果写入 REALITY_PRIVATE_KEY / REALITY_PUBLIC_KEY
@@ -275,20 +294,15 @@ resolve_public_addr() {
   else
     # 只取 IPv4：IPv6 地址直接拼进 host:port 会让链接失效
     PUBLIC_IP=$(curl -4 -s -m 5 'https://one.one.one.one/cdn-cgi/trace' | sed -n 's/^ip=//p')
-    [[ -n "$PUBLIC_IP" ]] || PUBLIC_IP="$CLOUDFLARE_IP"
     if [[ -n "$CERT_HOST" && -n "$PUBLIC_IP" ]]; then
-      # 先用本机解析；没匹配上再用 DoH 兜底(避免本机 DNS 缓存或缺少 getent 导致误判)
       ips="$(getent ahostsv4 "$CERT_HOST" 2>/dev/null | awk '{print $1}')"
-      grep -qxF "$PUBLIC_IP" <<< "$ips" || \
-        ips="$(curl -s -m 5 -H 'accept: application/dns-json' "https://1.1.1.1/dns-query?name=$CERT_HOST&type=A" 2>/dev/null \
-               | grep -oE '"data":"[0-9.]+"' | grep -oE '[0-9.]+')"
       if grep -qxF "$PUBLIC_IP" <<< "$ips"; then
         echo "[NET] $CERT_HOST points to this server, using it instead of the IP"
         PUBLIC_IP="$CERT_HOST"
       fi
     fi
   fi
-  [[ -n "$PUBLIC_IP" ]] || echo "[NET] Cannot determine the public address, links will be invalid (set CERT_HOST or CLOUDFLARE_IP)" >&2
+  [[ -n "$PUBLIC_IP" ]] || echo "[NET] Cannot determine the public address, links will be invalid (set CERT_HOST)" >&2
   echo "[NET] Address in links: $PUBLIC_IP"
 }
 
@@ -310,7 +324,7 @@ fi
 # 证书获取方式(仅 DNS-01，通过 lego + Cloudflare API)：
 #   CERT_HOST 为域名且填了 CF_TOKEN -> 申请可信证书；其余情况(留空 / 填 IP / 无 Token / 申请失败) -> 自签证书兜底
 # 产出：CERT_FILE / KEY_FILE(证书与私钥路径)、TLS_SERVER_NAME(SNI)、
-#   TLS_INSECURE(1=自签，订阅链接需跳过校验；0=可信)、TLS_PCS(自签证书的 SHA256 哈希，hex，链接里的 pcs / pinSHA256；可信时为空)
+#   TLS_INSECURE(1=自签，订阅链接需跳过校验；0=可信)、TLS_PCS(自签证书的 SHA256 哈希，hex，链接里的 pcs；可信时为空)
 
 # 生成自签证书：私钥用随机 RSA；已有且 30 天内不过期就复用，否则每次重启证书哈希都变，已导入的订阅会失效
 # 用 -config 写 SAN，兼容不支持 -addext 的老版本 openssl
@@ -340,7 +354,7 @@ issue_cert_for_host() {
   if [[ ! -x "$lego" ]]; then
     # /releases/latest 会 302 到 /releases/tag/vX.Y.Z，从最终 URL 取版本号(不走 API，无限流)
     ver=$(curl -fsSL -m 10 -o /dev/null -w '%{url_effective}' 'https://github.com/go-acme/lego/releases/latest' | sed -n 's|.*/tag/v\([0-9.]*\)$|\1|p')
-    [[ -n "$ver" ]] || { ver="4.35.2"; echo "[TLS] Cannot detect latest lego version, using $ver" >&2; }
+    [[ -n "$ver" ]] || { echo "[TLS] Cannot detect latest lego version" >&2; return 1; }
     dl "$BASE_DIR/lego.tar.gz" "https://github.com/go-acme/lego/releases/download/v${ver}/lego_v${ver}_linux_${ARCH}.tar.gz" || return 1
     tar -zxf "$BASE_DIR/lego.tar.gz" -C "$BASE_DIR" lego
     rm -f "$BASE_DIR/lego.tar.gz"
@@ -410,11 +424,7 @@ XRAY_CONF="$XRAY_DIR/config.json"
 mkdir -p "$XRAY_DIR"
 
 dl "$BASE_DIR/xray.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$([[ $ARCH == amd64 ]] && echo 64 || echo arm64-v8a).zip" || exit 1
-if command -v unzip >/dev/null 2>&1; then
-  unzip -oq "$BASE_DIR/xray.zip" -d "$XRAY_DIR"
-else
-  python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$BASE_DIR/xray.zip" "$XRAY_DIR"
-fi
+unzip -oq "$BASE_DIR/xray.zip" -d "$XRAY_DIR"
 rm -f "$BASE_DIR/xray.zip"
 chmod +x "$XRAY_BIN" 2>/dev/null
 [[ -x "$XRAY_BIN" ]] || { echo "[XRAY] Binary not found after extraction: $XRAY_BIN" >&2; exit 1; }
@@ -533,10 +543,10 @@ reality_link() {
   esac
 }
 
-# Hysteria2 链接：自签证书时带 insecure=1 和 pinSHA256(证书哈希，hex)
+# Hysteria2 链接：自签证书时带 insecure=1(跳过证书校验，不再固定证书哈希)
 hy2_link() {
   local q="sni=$TLS_SERVER_NAME"
-  [[ "$TLS_INSECURE" == 1 ]] && q+="&insecure=1&pinSHA256=$TLS_PCS"
+  [[ "$TLS_INSECURE" == 1 ]] && q+="&insecure=1"
   echo "hysteria2://$UUID@$PUBLIC_IP:$HY2_PORT/?$q#$NAME_ENC-HY2"
 }
 
